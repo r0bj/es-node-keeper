@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	ver string = "0.10"
+	ver string = "0.12"
 	interval int = 30
 )
 
@@ -267,6 +267,11 @@ func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]inte
 }
 
 func main() {
+	customFormatter := new(log.TextFormatter)
+	customFormatter.TimestampFormat = "2006-01-02 15:04:05"
+	log.SetFormatter(customFormatter)
+	customFormatter.FullTimestamp = true
+
 	kingpin.Version(ver)
 	kingpin.Parse()
 
@@ -280,6 +285,7 @@ func main() {
 	}
 
 	log.Infof("Loaded config: %s", localNodes)
+	log.Infof("Using elasticsearch URL: %s", *esURL)
 
 	go nodeKeeper(*esURL, *timeout, localNodesToMap(localNodes), *noRestartTime, *dryRun)
 	select {}
