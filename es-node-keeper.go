@@ -25,6 +25,7 @@ var (
 	timeout = kingpin.Flag("timeout", "timeout for HTTP requests in seconds").Default("10").Short('t').Int()
 	config = kingpin.Flag("config", "config file path").Default("/etc/es-node-keeper.yaml").Short('c').String()
 	noRestartTime = kingpin.Flag("no-restart-time", "minimal time in minutes between restarts").Default("10").Short('d').Int()
+	dryRun = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
 )
 
 // Node : struct contains active node name
@@ -105,13 +106,13 @@ func parseClusterSettings(data string) (ClusterSettings, error) {
 func parseConfig(file string) (LocalNodes, error) {
 	var nodes LocalNodes
 	source, err := ioutil.ReadFile(file)
-	if err != nil {
-		return nodes, err
-	}
-
-	err = yaml.Unmarshal([]byte(source), &nodes)
-	if err != nil {
-		return nodes, err
+	if err == nil {
+		err = yaml.Unmarshal([]byte(source), &nodes)
+		if err != nil {
+			return nodes, err
+		}
+	} else {
+		log.Warnf("Cannot get local nodes from config file %s, using empty config", *config)
 	}
 
 	return nodes, nil
@@ -203,11 +204,16 @@ func localNodesToMap(localNodes LocalNodes) map[string]map[string]interface{} {
 	return nodes
 }
 
-func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]interface{}, noRestartTime int) {
+func sleepLoop() {
+	time.Sleep(time.Second * time.Duration(interval))
+}
+
+func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]interface{}, noRestartTime int, dryRun bool) {
 	for {
 		activeNodes, err := getActiveNodes(esURL, timeout)
 		if err != nil {
 			log.Warn("Cannot get active nodes from cluster")
+			sleepLoop()
 			continue
 		}
 
@@ -238,11 +244,15 @@ func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]inte
 							localNodes[service]["instance"],
 							service,
 						)
-						if err := restartNode(service); err == nil {
-							log.Infof("Service %s restarted", service)
-							localNodes[service]["lastRestart"] = now
+						if dryRun {
+							log.Info("Dry run, skipping")
 						} else {
-							log.Errorf("Cannot restart service %s: %s", service, err)
+							if err := restartNode(service); err == nil {
+								log.Infof("Service %s restarted", service)
+								localNodes[service]["lastRestart"] = now
+							} else {
+								log.Errorf("Cannot restart service %s: %s", service, err)
+							}
 						}
 					} else {
 						log.Debugf("Cannot restart service %s due to cluster conditions", service)
@@ -252,7 +262,7 @@ func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]inte
 				}
 			}
 		}
-		time.Sleep(time.Second * time.Duration(interval))
+		sleepLoop()
 	}
 }
 
@@ -260,11 +270,17 @@ func main() {
 	kingpin.Version(ver)
 	kingpin.Parse()
 
+	if *dryRun {
+		log.Info("Running in dry run mode")
+	}
+
 	localNodes, err := parseConfig(*config)
 	if err != nil {
 		log.Fatalf("Cannot get local nodes from config file %s", *config)
 	}
 
-	go nodeKeeper(*esURL, *timeout, localNodesToMap(localNodes), *noRestartTime)
+	log.Infof("Loaded config: %s", localNodes)
+
+	go nodeKeeper(*esURL, *timeout, localNodesToMap(localNodes), *noRestartTime, *dryRun)
 	select {}
 }
