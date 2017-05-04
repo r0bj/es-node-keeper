@@ -227,6 +227,11 @@ func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]inte
 						log.Warn("Cannot get cluster routing allocation")
 						continue
 					}
+
+					if clusterRoutingAllocation == "" {
+						log.Warn("Cluster routing allocation is empty")
+						continue
+					}
 								
 					if strings.ToLower(clusterStatus) != "red" && strings.ToLower(clusterRoutingAllocation) == "all" {
 						log.Infof("Node %s is not active member of cluster, restarting service %s",
