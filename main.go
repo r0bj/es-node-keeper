@@ -1,52 +1,50 @@
 package main
 
 import (
-	"fmt"
-	"time"
-	"strings"
-	"encoding/json"
-	"io/ioutil"
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log/slog"
+	"net/http"
+	"os"
 	"os/exec"
+	"strings"
+	"time"
 
-	"github.com/parnurzeal/gorequest"
-	"gopkg.in/alecthomas/kingpin.v2"
-	log "github.com/Sirupsen/logrus"
+	"github.com/alecthomas/kingpin/v2"
 	"gopkg.in/yaml.v2"
 )
 
 const (
-	ver string = "0.12"
-	interval int = 30
+	ver      string = "0.13"
+	interval int    = 30
 )
 
 var (
-	esURL = kingpin.Flag("url", "elasticsearch URL").Default("http://localhost:9200").Short('u').String()
-	timeout = kingpin.Flag("timeout", "timeout for HTTP requests in seconds").Default("10").Short('t').Int()
-	config = kingpin.Flag("config", "config file path").Default("/etc/es-node-keeper.yaml").Short('c').String()
+	esUrl         = kingpin.Flag("url", "elasticsearch URL").Default("http://localhost:9200").Short('u').String()
+	timeout       = kingpin.Flag("timeout", "timeout for HTTP requests in seconds").Default("10").Short('t').Int()
+	config        = kingpin.Flag("config", "config file path").Default("/etc/es-node-keeper.yaml").Short('c').String()
 	noRestartTime = kingpin.Flag("no-restart-time", "minimal time in minutes between restarts").Default("10").Short('d').Int()
-	dryRun = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
+	dryRun        = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
+	verbose       = kingpin.Flag("verbose", "Verbose mode.").Short('v').Bool()
 )
 
-// Node : struct contains active node name
 type Node struct {
 	Name string `json:"name"`
 }
 
-// LocalNodes : struct contains local nodes data
 type LocalNodes struct {
 	Nodes []struct {
 		Instance string `yaml:"instance"`
-		Service string `yaml:"service"`
+		Service  string `yaml:"service"`
 	} `yaml:"nodes"`
 }
 
-// ClusterStatus : struct contains cluster status data
 type ClusterStatus struct {
 	Status string `json:"status"`
 }
 
-// ClusterSettings : struct contains cluster settings data
 type ClusterSettings struct {
 	Transient struct {
 		Cluster struct {
@@ -59,21 +57,31 @@ type ClusterSettings struct {
 	} `json:"transient"`
 }
 
-func esQueryGet(url string, timeout int) (string, error) {
-	request := gorequest.New()
-	resp, body, errs := request.Get(url).Timeout(time.Duration(timeout) * time.Second).End()
+func httpGet(url string) (string, error) {
+	client := &http.Client{
+		Timeout: time.Second * time.Duration(*timeout),
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
 
-	if errs != nil {
-		var errsStr []string
-		for _, e := range errs {
-			errsStr = append(errsStr, fmt.Sprintf("%s", e))
-		}
-		return "", fmt.Errorf("%s", strings.Join(errsStr, ", "))
+	// Close the connection after sending request and reading its response
+	// It prevents re-use of TCP connections between requests to the same hosts
+	req.Close = true
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
 	}
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP response code: %s", resp.Status)
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
 	}
-	return body, nil
+
+	return string(body), nil
 }
 
 func parseNodes(data string) ([]Node, error) {
@@ -82,6 +90,7 @@ func parseNodes(data string) ([]Node, error) {
 	if err != nil {
 		return nodes, fmt.Errorf("JSON parse failed")
 	}
+
 	return nodes, nil
 }
 
@@ -91,6 +100,7 @@ func parseClusterStatus(data string) (ClusterStatus, error) {
 	if err != nil {
 		return clusterStatus, fmt.Errorf("JSON parse failed")
 	}
+
 	return clusterStatus, nil
 }
 
@@ -100,6 +110,7 @@ func parseClusterSettings(data string) (ClusterSettings, error) {
 	if err != nil {
 		return clusterSettings, fmt.Errorf("JSON parse failed")
 	}
+
 	return clusterSettings, nil
 }
 
@@ -112,16 +123,16 @@ func parseConfig(file string) (LocalNodes, error) {
 			return nodes, err
 		}
 	} else {
-		log.Warnf("Cannot get local nodes from config file %s, using empty config", *config)
+		slog.Warn("Cannot get local nodes from config file, using empty config", "file", *config)
 	}
 
 	return nodes, nil
 }
 
-func getActiveNodes(esURL string, timeout int) (map[string]struct{}, error) {
-	url := esURL + "/_cat/nodes?h=name&format=json"
+func getActiveNodes(esUrl string) (map[string]struct{}, error) {
+	url := esUrl + "/_cat/nodes?h=name&format=json"
 
-	esData, err := esQueryGet(url, timeout)
+	esData, err := httpGet(url)
 	if err != nil {
 		return map[string]struct{}{}, err
 	}
@@ -139,10 +150,10 @@ func getActiveNodes(esURL string, timeout int) (map[string]struct{}, error) {
 	return result, nil
 }
 
-func getClusterStatus(esURL string, timeout int) (string, error) {
-	url := esURL + "/_cluster/health"
+func getClusterStatus(esUrl string) (string, error) {
+	url := esUrl + "/_cluster/health"
 
-	esData, err := esQueryGet(url, timeout)
+	esData, err := httpGet(url)
 	if err != nil {
 		return "", err
 	}
@@ -155,10 +166,10 @@ func getClusterStatus(esURL string, timeout int) (string, error) {
 	return clusterStatus.Status, nil
 }
 
-func getClusterRoutingAllocation(esURL string, timeout int) (string, error) {
-	url := esURL + "/_cluster/settings"
+func getClusterRoutingAllocation(esUrl string) (string, error) {
+	url := esUrl + "/_cluster/settings"
 
-	esData, err := esQueryGet(url, timeout)
+	esData, err := httpGet(url)
 	if err != nil {
 		return "", err
 	}
@@ -178,18 +189,21 @@ func getInvalidNodes(localNodes map[string]map[string]interface{}, activeNodes m
 			nodesToRestart = append(nodesToRestart, service)
 		}
 	}
+
 	return nodesToRestart
 }
 
-func restartNode(node string) error {
-	command := "service"
-	args := []string{node, "restart"}
+func restartSystemdService(service string) error {
+	command := "systemctl"
+	args := []string{"restart", service}
 	cmd := exec.Command(command, args...)
+
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf(fmt.Sprint(err) + ": " + stderr.String())
 	}
+
 	return nil
 }
 
@@ -197,7 +211,7 @@ func localNodesToMap(localNodes LocalNodes) map[string]map[string]interface{} {
 	nodes := make(map[string]map[string]interface{})
 	for _, localNode := range localNodes.Nodes {
 		nodes[localNode.Service] = map[string]interface{}{
-			"instance": localNode.Instance,
+			"instance":    localNode.Instance,
 			"lastRestart": 0,
 		}
 	}
@@ -205,14 +219,14 @@ func localNodesToMap(localNodes LocalNodes) map[string]map[string]interface{} {
 }
 
 func sleepLoop() {
-	time.Sleep(time.Second * time.Duration(interval))
+       time.Sleep(time.Second * time.Duration(interval))
 }
 
-func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]interface{}, noRestartTime int, dryRun bool) {
+func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
 	for {
-		activeNodes, err := getActiveNodes(esURL, timeout)
+		activeNodes, err := getActiveNodes(esUrl)
 		if err != nil {
-			log.Warn("Cannot get active nodes from cluster")
+			slog.Warn("Cannot get active nodes from cluster")
 			sleepLoop()
 			continue
 		}
@@ -220,73 +234,85 @@ func nodeKeeper(esURL string, timeout int, localNodes map[string]map[string]inte
 		invalidNodes := getInvalidNodes(localNodes, activeNodes)
 		if len(invalidNodes) > 0 {
 			for _, service := range invalidNodes {
+				systemdService := fmt.Sprintf("%s.service", service)
+
 				now := int(time.Now().Unix())
-				if now - localNodes[service]["lastRestart"].(int) > noRestartTime * 60 {
-					clusterStatus, err := getClusterStatus(esURL, timeout)
+				if now-localNodes[service]["lastRestart"].(int) > *noRestartTime*60 {
+					clusterStatus, err := getClusterStatus(esUrl)
 					if err != nil {
-						log.Warn("Cannot get cluster status")
+						slog.Warn("Cannot get cluster status")
 						continue
 					}
 
-					clusterRoutingAllocation, err := getClusterRoutingAllocation(esURL, timeout)
+					clusterRoutingAllocation, err := getClusterRoutingAllocation(esUrl)
 					if err != nil {
-						log.Warn("Cannot get cluster routing allocation")
+						slog.Warn("Cannot get cluster routing allocation")
 						continue
 					}
 
 					if clusterRoutingAllocation == "" {
-						log.Warn("Cluster routing allocation is empty")
+						slog.Warn("Cluster routing allocation is empty")
 						continue
 					}
-								
+
 					if strings.ToLower(clusterStatus) != "red" && strings.ToLower(clusterRoutingAllocation) == "all" {
-						log.Infof("Node %s is not active member of cluster, restarting service %s",
+						slog.Info("Local node is not an active member of the cluster, restarting service",
+							"node",
 							localNodes[service]["instance"],
-							service,
+							"service",
+							systemdService,
 						)
-						if dryRun {
-							log.Info("Dry run, skipping")
+						if *dryRun {
+							slog.Info("Dry run, skipping")
 						} else {
-							if err := restartNode(service); err == nil {
-								log.Infof("Service %s restarted", service)
+							if err := restartSystemdService(systemdService); err == nil {
+								slog.Info("Service restarted", "service", systemdService)
 								localNodes[service]["lastRestart"] = now
 							} else {
-								log.Errorf("Cannot restart service %s: %s", service, err)
+								slog.Error("Cannot restart service", "service", service, "error", err)
 							}
 						}
 					} else {
-						log.Debugf("Cannot restart service %s due to cluster conditions", service)
+						slog.Debug("Cannot restart service due to cluster conditions", "service", service)
 					}
 				} else {
-					log.Debugf("Cannot restart service %s due to minimal time between restarts parameter", service)
+					slog.Debug("Cannot restart service due to minimal time between restarts", "service", service)
 				}
 			}
+		} else {
+			slog.Debug("All local nodes are active members of the cluster")
 		}
 		sleepLoop()
 	}
 }
 
 func main() {
-	customFormatter := new(log.TextFormatter)
-	customFormatter.TimestampFormat = "2006-01-02 15:04:05"
-	log.SetFormatter(customFormatter)
-	customFormatter.FullTimestamp = true
+	var loggingLevel = new(slog.LevelVar)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: loggingLevel}))
+	slog.SetDefault(logger)
 
 	kingpin.Version(ver)
 	kingpin.Parse()
 
+	if *verbose {
+		loggingLevel.Set(slog.LevelDebug)
+	}
+
+	slog.Info("Starting", "version", ver)
+
 	if *dryRun {
-		log.Info("Running in dry run mode")
+		slog.Info("Running in dry run mode")
 	}
 
 	localNodes, err := parseConfig(*config)
 	if err != nil {
-		log.Fatalf("Cannot get local nodes from config file %s", *config)
+		slog.Error("Cannot get local nodes from config", "file", *config)
+		os.Exit(1)
 	}
 
-	log.Infof("Loaded config: %s", localNodes)
-	log.Infof("Using elasticsearch URL: %s", *esURL)
+	slog.Info("Loaded", "config", localNodes)
+	slog.Info("Elasticsearch URL", "url", *esUrl)
 
-	go nodeKeeper(*esURL, *timeout, localNodesToMap(localNodes), *noRestartTime, *dryRun)
+	go nodeKeeper(*esUrl, localNodesToMap(localNodes))
 	select {}
 }
