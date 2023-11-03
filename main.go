@@ -13,11 +13,11 @@ import (
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
-	ver      string = "0.13"
+	ver      string = "0.14"
 	interval int    = 30
 )
 

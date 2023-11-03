@@ -4,7 +4,7 @@ go 1.21.3
 
 require (
 	github.com/alecthomas/kingpin/v2 v2.3.2
-	gopkg.in/yaml.v2 v2.4.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
