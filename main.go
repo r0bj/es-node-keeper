@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -17,17 +18,18 @@ import (
 )
 
 const (
-	ver      string = "0.14"
-	interval int    = 30
+	ver               string = "0.16"
+	interval          int    = 30
+	systemdDateLayout string = "Mon 2006-01-02 15:04:05 MST"
 )
 
 var (
-	esUrl         = kingpin.Flag("url", "elasticsearch URL").Default("http://localhost:9200").Short('u').String()
-	timeout       = kingpin.Flag("timeout", "timeout for HTTP requests in seconds").Default("10").Short('t').Int()
-	config        = kingpin.Flag("config", "config file path").Default("/etc/es-node-keeper.yaml").Short('c').String()
-	noRestartTime = kingpin.Flag("no-restart-time", "minimal time in minutes between restarts").Default("10").Short('d').Int()
-	dryRun        = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
-	verbose       = kingpin.Flag("verbose", "Verbose mode.").Short('v').Bool()
+	esUrl                  = kingpin.Flag("url", "elasticsearch URL").Default("http://localhost:9200").Short('u').String()
+	timeout                = kingpin.Flag("timeout", "timeout for HTTP requests in seconds").Default("10").Short('t').Int()
+	config                 = kingpin.Flag("config", "config file path").Default("/etc/es-node-keeper.yaml").Short('c').String()
+	restartExclusionPeriod = kingpin.Flag("restart-exclusion-period", "minimal time in seconds between service restarts").Default("600").Int()
+	dryRun                 = kingpin.Flag("dry-run", "dry run").Short('n').Bool()
+	verbose                = kingpin.Flag("verbose", "Verbose mode.").Short('v').Bool()
 )
 
 type Node struct {
@@ -194,14 +196,9 @@ func getInvalidNodes(localNodes map[string]map[string]interface{}, activeNodes m
 }
 
 func restartSystemdService(service string) error {
-	command := "systemctl"
-	args := []string{"restart", service}
-	cmd := exec.Command(command, args...)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf(fmt.Sprint(err) + ": " + stderr.String())
+	_, err := executeCommand("systemctl", []string{"restart", service})
+	if err != nil {
+		return fmt.Errorf("Command execution fail: %v", err)
 	}
 
 	return nil
@@ -215,11 +212,48 @@ func localNodesToMap(localNodes LocalNodes) map[string]map[string]interface{} {
 			"lastRestart": 0,
 		}
 	}
+
 	return nodes
 }
 
+func executeCommand(command string, args []string) (string, error) {
+	cmd := exec.Command(command, args...)
+	slog.Debug("Executing", "command", fmt.Sprintf("%v %v", command, strings.Join(args, " ")))
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%s: %s", err, stderr.String())
+	}
+
+	return stdout.String(), nil
+}
+
+func getSystemdServiceRunningTime(service string) (int, error) {
+	stdout, err := executeCommand("systemctl", []string{"--no-pager", "--property=ActiveEnterTimestamp", "show", service})
+	if err != nil {
+		return 0, fmt.Errorf("Command execution fail: %v", err)
+	}
+
+	r := regexp.MustCompile(`ActiveEnterTimestamp=([ a-zA-Z0-9:-]+)`)
+	findStrResult := r.FindStringSubmatch(stdout)
+	if len(findStrResult) < 2 {
+		return 0, fmt.Errorf("Cannot find timestamp string in command output")
+	}
+
+	timestamp, err := time.Parse(systemdDateLayout, findStrResult[1])
+	if err != nil {
+		return 0, fmt.Errorf("Parse date failed: %v", err)
+	}
+
+	return int(time.Now().Unix() - timestamp.Unix()), nil
+}
+
 func sleepLoop() {
-       time.Sleep(time.Second * time.Duration(interval))
+	time.Sleep(time.Second * time.Duration(interval))
 }
 
 func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
@@ -236,8 +270,15 @@ func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
 			for _, service := range invalidNodes {
 				systemdService := fmt.Sprintf("%s.service", service)
 
+				runningTime, err := getSystemdServiceRunningTime(systemdService)
+				if err == nil {
+					localNodes[service]["lastRestart"] = runningTime
+				} else {
+					slog.Warn("Cannot get systemd service running time", "error", err)
+				}
+
 				now := int(time.Now().Unix())
-				if now-localNodes[service]["lastRestart"].(int) > *noRestartTime*60 {
+				if now-localNodes[service]["lastRestart"].(int) > *restartExclusionPeriod {
 					clusterStatus, err := getClusterStatus(esUrl)
 					if err != nil {
 						slog.Warn("Cannot get cluster status")
@@ -276,7 +317,7 @@ func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
 						slog.Debug("Cannot restart service due to cluster conditions", "service", service)
 					}
 				} else {
-					slog.Debug("Cannot restart service due to minimal time between restarts", "service", service)
+					slog.Debug("Cannot restart service because the minimum time between restarts has not been met", "service", service)
 				}
 			}
 		} else {
