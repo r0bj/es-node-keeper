@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	ver               string = "0.16"
+	ver               string = "0.19"
 	interval          int    = 30
 	systemdDateLayout string = "Mon 2006-01-02 15:04:05 MST"
 )
@@ -208,8 +208,8 @@ func localNodesToMap(localNodes LocalNodes) map[string]map[string]interface{} {
 	nodes := make(map[string]map[string]interface{})
 	for _, localNode := range localNodes.Nodes {
 		nodes[localNode.Service] = map[string]interface{}{
-			"instance":    localNode.Instance,
-			"lastRestart": 0,
+			"instance":             localNode.Instance,
+			"lastRestartTimestamp": 0,
 		}
 	}
 
@@ -232,7 +232,7 @@ func executeCommand(command string, args []string) (string, error) {
 	return stdout.String(), nil
 }
 
-func getSystemdServiceRunningTime(service string) (int, error) {
+func getSystemdServiceActiveEnterTimestamp(service string) (int, error) {
 	stdout, err := executeCommand("systemctl", []string{"--no-pager", "--property=ActiveEnterTimestamp", "show", service})
 	if err != nil {
 		return 0, fmt.Errorf("Command execution fail: %v", err)
@@ -249,7 +249,7 @@ func getSystemdServiceRunningTime(service string) (int, error) {
 		return 0, fmt.Errorf("Parse date failed: %v", err)
 	}
 
-	return int(time.Now().Unix() - timestamp.Unix()), nil
+	return int(timestamp.Unix()), nil
 }
 
 func sleepLoop() {
@@ -270,15 +270,15 @@ func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
 			for _, service := range invalidNodes {
 				systemdService := fmt.Sprintf("%s.service", service)
 
-				runningTime, err := getSystemdServiceRunningTime(systemdService)
+				serviceActiveEnterTimestamp, err := getSystemdServiceActiveEnterTimestamp(systemdService)
 				if err == nil {
-					localNodes[service]["lastRestart"] = runningTime
+					localNodes[service]["lastRestartTimestamp"] = serviceActiveEnterTimestamp
 				} else {
 					slog.Warn("Cannot get systemd service running time", "error", err)
 				}
 
 				now := int(time.Now().Unix())
-				if now-localNodes[service]["lastRestart"].(int) > *restartExclusionPeriod {
+				if now-localNodes[service]["lastRestartTimestamp"].(int) > *restartExclusionPeriod {
 					clusterStatus, err := getClusterStatus(esUrl)
 					if err != nil {
 						slog.Warn("Cannot get cluster status")
@@ -308,7 +308,7 @@ func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
 						} else {
 							if err := restartSystemdService(systemdService); err == nil {
 								slog.Info("Service restarted", "service", systemdService)
-								localNodes[service]["lastRestart"] = now
+								localNodes[service]["lastRestartTimestamp"] = now
 							} else {
 								slog.Error("Cannot restart service", "service", service, "error", err)
 							}
