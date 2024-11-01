@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	ver               string = "0.19"
+	ver               string = "0.21"
 	interval          int    = 30
 	systemdDateLayout string = "Mon 2006-01-02 15:04:05 MST"
 )
@@ -78,7 +78,7 @@ func httpGet(url string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
@@ -118,14 +118,13 @@ func parseClusterSettings(data string) (ClusterSettings, error) {
 
 func parseConfig(file string) (LocalNodes, error) {
 	var nodes LocalNodes
-	source, err := ioutil.ReadFile(file)
-	if err == nil {
-		err = yaml.Unmarshal([]byte(source), &nodes)
-		if err != nil {
-			return nodes, err
-		}
-	} else {
-		slog.Warn("Cannot get local nodes from config file, using empty config", "file", *config)
+	source, err := os.ReadFile(file)
+	if err != nil {
+		return nodes, fmt.Errorf("Failed to read config file %s: %w", file, err)
+	}
+
+	if err := yaml.Unmarshal([]byte(source), &nodes); err != nil {
+		return nodes, fmt.Errorf("Failed to parse YAML config: %w", err)
 	}
 
 	return nodes, nil
@@ -198,7 +197,7 @@ func getInvalidNodes(localNodes map[string]map[string]interface{}, activeNodes m
 func restartSystemdService(service string) error {
 	_, err := executeCommand("systemctl", []string{"restart", service})
 	if err != nil {
-		return fmt.Errorf("Command execution fail: %v", err)
+		return fmt.Errorf("Command execution fail: %w", err)
 	}
 
 	return nil
@@ -226,7 +225,7 @@ func executeCommand(command string, args []string) (string, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s: %s", err, stderr.String())
+		return "", fmt.Errorf("%w: %s", err, stderr.String())
 	}
 
 	return stdout.String(), nil
@@ -235,7 +234,7 @@ func executeCommand(command string, args []string) (string, error) {
 func getSystemdServiceActiveEnterTimestamp(service string) (int, error) {
 	stdout, err := executeCommand("systemctl", []string{"--no-pager", "--property=ActiveEnterTimestamp", "show", service})
 	if err != nil {
-		return 0, fmt.Errorf("Command execution fail: %v", err)
+		return 0, fmt.Errorf("Command execution fail: %w", err)
 	}
 
 	r := regexp.MustCompile(`ActiveEnterTimestamp=([ a-zA-Z0-9:-]+)`)
@@ -246,84 +245,93 @@ func getSystemdServiceActiveEnterTimestamp(service string) (int, error) {
 
 	timestamp, err := time.Parse(systemdDateLayout, findStrResult[1])
 	if err != nil {
-		return 0, fmt.Errorf("Parse date failed: %v", err)
+		return 0, fmt.Errorf("Parse date failed: %w", err)
 	}
 
 	return int(timestamp.Unix()), nil
 }
 
-func sleepLoop() {
-	time.Sleep(time.Second * time.Duration(interval))
+func performNodeCheck(esUrl string, localNodes map[string]map[string]interface{}) error {
+	activeNodes, err := getActiveNodes(esUrl)
+	if err != nil {
+		return fmt.Errorf("Cannot get active nodes from cluster: %w", err)
+	}
+
+	invalidNodes := getInvalidNodes(localNodes, activeNodes)
+	if len(invalidNodes) > 0 {
+		for _, service := range invalidNodes {
+			systemdService := fmt.Sprintf("%s.service", service)
+
+			serviceActiveEnterTimestamp, err := getSystemdServiceActiveEnterTimestamp(systemdService)
+			if err == nil {
+				localNodes[service]["lastRestartTimestamp"] = serviceActiveEnterTimestamp
+			} else {
+				slog.Warn("Cannot get systemd service running time", "error", err)
+			}
+
+			now := int(time.Now().Unix())
+			if now-localNodes[service]["lastRestartTimestamp"].(int) > *restartExclusionPeriod {
+				clusterStatus, err := getClusterStatus(esUrl)
+				if err != nil {
+					slog.Warn("Cannot get cluster status", "error", err)
+					continue
+				}
+
+				clusterRoutingAllocation, err := getClusterRoutingAllocation(esUrl)
+				if err != nil {
+					slog.Warn("Cannot get cluster routing allocation", "error", err)
+					continue
+				}
+
+				if clusterRoutingAllocation == "" {
+					slog.Warn("Cluster routing allocation is empty")
+					continue
+				}
+
+				if strings.ToLower(clusterStatus) != "red" && strings.ToLower(clusterRoutingAllocation) == "all" {
+					slog.Info("Local node is not an active member of the cluster, restarting service",
+						"node",
+						localNodes[service]["instance"],
+						"service",
+						systemdService,
+					)
+					if *dryRun {
+						slog.Info("Dry run, skipping")
+					} else {
+						if err := restartSystemdService(systemdService); err == nil {
+							slog.Info("Service restarted", "service", systemdService)
+							localNodes[service]["lastRestartTimestamp"] = now
+						} else {
+							slog.Error("Cannot restart service", "service", service, "error", err)
+						}
+					}
+				} else {
+					slog.Debug("Cannot restart service due to cluster conditions", "service", service)
+				}
+			} else {
+				slog.Debug("Cannot restart service because the minimum time between restarts has not been met", "service", service)
+			}
+		}
+	} else {
+		slog.Debug("All local nodes are active members of the cluster")
+	}
+
+	return nil
 }
 
+
 func nodeKeeper(esUrl string, localNodes map[string]map[string]interface{}) {
-	for {
-		activeNodes, err := getActiveNodes(esUrl)
-		if err != nil {
-			slog.Warn("Cannot get active nodes from cluster")
-			sleepLoop()
-			continue
+	ticker := time.NewTicker(time.Second * time.Duration(interval))
+	defer ticker.Stop()
+
+	if err := performNodeCheck(esUrl, localNodes); err != nil {
+		slog.Warn(err.Error())
+	}
+
+	for range ticker.C {
+		if err := performNodeCheck(esUrl, localNodes); err != nil {
+			slog.Warn(err.Error())
 		}
-
-		invalidNodes := getInvalidNodes(localNodes, activeNodes)
-		if len(invalidNodes) > 0 {
-			for _, service := range invalidNodes {
-				systemdService := fmt.Sprintf("%s.service", service)
-
-				serviceActiveEnterTimestamp, err := getSystemdServiceActiveEnterTimestamp(systemdService)
-				if err == nil {
-					localNodes[service]["lastRestartTimestamp"] = serviceActiveEnterTimestamp
-				} else {
-					slog.Warn("Cannot get systemd service running time", "error", err)
-				}
-
-				now := int(time.Now().Unix())
-				if now-localNodes[service]["lastRestartTimestamp"].(int) > *restartExclusionPeriod {
-					clusterStatus, err := getClusterStatus(esUrl)
-					if err != nil {
-						slog.Warn("Cannot get cluster status")
-						continue
-					}
-
-					clusterRoutingAllocation, err := getClusterRoutingAllocation(esUrl)
-					if err != nil {
-						slog.Warn("Cannot get cluster routing allocation")
-						continue
-					}
-
-					if clusterRoutingAllocation == "" {
-						slog.Warn("Cluster routing allocation is empty")
-						continue
-					}
-
-					if strings.ToLower(clusterStatus) != "red" && strings.ToLower(clusterRoutingAllocation) == "all" {
-						slog.Info("Local node is not an active member of the cluster, restarting service",
-							"node",
-							localNodes[service]["instance"],
-							"service",
-							systemdService,
-						)
-						if *dryRun {
-							slog.Info("Dry run, skipping")
-						} else {
-							if err := restartSystemdService(systemdService); err == nil {
-								slog.Info("Service restarted", "service", systemdService)
-								localNodes[service]["lastRestartTimestamp"] = now
-							} else {
-								slog.Error("Cannot restart service", "service", service, "error", err)
-							}
-						}
-					} else {
-						slog.Debug("Cannot restart service due to cluster conditions", "service", service)
-					}
-				} else {
-					slog.Debug("Cannot restart service because the minimum time between restarts has not been met", "service", service)
-				}
-			}
-		} else {
-			slog.Debug("All local nodes are active members of the cluster")
-		}
-		sleepLoop()
 	}
 }
 
@@ -347,7 +355,7 @@ func main() {
 
 	localNodes, err := parseConfig(*config)
 	if err != nil {
-		slog.Error("Cannot get local nodes from config", "file", *config)
+		slog.Error("Cannot get local nodes from config", "file", *config, "error", err)
 		os.Exit(1)
 	}
 
