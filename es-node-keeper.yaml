@@ -1,0 +1,18 @@
+---
+nodes:
+- instance: logs-s1-master
+  service: elasticsearch-master
+- instance: logs-s1-query
+  service: elasticsearch-query
+- instance: logs-s1-data1
+  service: elasticsearch-data1
+- instance: logs-s1-data2
+  service: elasticsearch-data2
+- instance: logs-s1-data3
+  service: elasticsearch-data3
+- instance: logs-s1-data4
+  service: elasticsearch-data4
+- instance: logs-s1-data5
+  service: elasticsearch-data5
+- instance: logs-s1-data62
+  service: elasticsearch-data6
